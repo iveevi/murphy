@@ -1,15 +1,19 @@
 #include <iostream>
 #include <vector>
 #include <algorithm>
+#include <utility>
+#include <tuple>
+#include <random>
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
 #include <glm/glm.hpp>
 #include <glm/gtx/closest_point.hpp>
+#include <glm/gtx/rotate_vector.hpp>
 
-constexpr int WINDOW_WIDTH = 800;
-constexpr int WINDOW_HEIGHT = 600;
+constexpr int WINDOW_WIDTH = 750;
+constexpr int WINDOW_HEIGHT = 750;
 
 GLFWwindow *glfw_init();
 
@@ -95,6 +99,14 @@ struct {
                 return (point + glm::vec2 { xrange, yrange }) / (2.0f * glm::vec2 { xrange, yrange });
         }
 
+        glm::vec2 to_screen(const glm::vec2 &point) {
+                return to_uv(point) * glm::vec2 { WINDOW_WIDTH, WINDOW_HEIGHT };
+        }
+
+        glm::vec2 to_cartesian(const glm::vec2 &uv) {
+                return 2.0f * glm::vec2 { xrange, yrange } * uv - glm::vec2 { xrange, yrange };
+        }
+
         float to_uv_x(float x) {
                 return (x + xrange) / (2.0f * xrange);
         }
@@ -117,7 +129,7 @@ float distance(const LineSegment &line, const glm::vec2 &point)
 }
 
 // TODO: thickness
-void rasterize_boundary(Image <SingleChannel> &img, const LineSegment &line)
+void rasterize_line(Image <SingleChannel> &img, const LineSegment &line)
 {
         float thickness = 2.0f * viewport.epsilon;
         glm::vec2 line_min = viewport.to_uv(glm::min(line.v0, line.v1) - thickness);
@@ -135,7 +147,6 @@ void rasterize_boundary(Image <SingleChannel> &img, const LineSegment &line)
                         glm::vec2 uv = glm::vec2 { x, y } / glm::vec2 { img.width, img.height };
                         glm::vec2 point = glm::vec2 { viewport.xrange, viewport.yrange } * (uv - 0.5f) * 2.0f;
 
-                        // TODO: smoothstep
                         float dist = distance(line, point);
                         if (dist < thickness) {
                                 // Fall off after epsilon
@@ -146,7 +157,34 @@ void rasterize_boundary(Image <SingleChannel> &img, const LineSegment &line)
         }
 }
 
+void rasterize_arrow(Image <SingleChannel> &img, const glm::vec2 &origin, const glm::vec2 &direction)
+{
+        glm::vec2 v0 = origin;
+        glm::vec2 v1 = origin + direction;
+
+        glm::vec2 left = -glm::rotate(direction, glm::radians(30.0f))/10.0f;
+        glm::vec2 right = -glm::rotate(direction, glm::radians(-30.0f))/10.0f;
+
+        rasterize_line(img, { v0, v1 });
+        rasterize_line(img, { v1, v1 + left });
+        rasterize_line(img, { v1, v1 + right });
+}
+
+void quiver(Image <SingleChannel> &img, const std::vector <glm::vec2> &points, const std::vector <glm::vec2> &directions)
+{
+        for (int i = 0; i < points.size(); i++)
+                rasterize_arrow(img, points[i], directions[i]);
+}
+
 using Curve = std::vector <glm::vec2>;
+
+void rasterize_boundary(Image <SingleChannel> &img, const Curve &curve)
+{
+        for (int i = 0; i < curve.size(); i++) {
+                int j = (i + 1) % curve.size();
+                rasterize_line(img, { curve[i], curve[j] });
+        }
+}
 
 std::pair <glm::vec2, glm::vec2> bounds(const Curve &curve)
 {
@@ -179,13 +217,13 @@ void rasterize_interior(Image <SingleChannel> &dst, const Curve &curve, const gl
                 float cy = viewport.to_cartesian_y(float(y)/dst.height);
 
                 // Check whether (and when) the curve intersects the horizontal line
-                std::vector <int32_t> intersections;
+                std::vector <float> intersections;
                 for (int i = 0; i < curve.size(); i++) {
                         int j = (i + 1) % curve.size();
                         const glm::vec2 &p0 = curve[i];
                         const glm::vec2 &p1 = curve[j];
 
-                        // Skip if the line is horizontal
+                        // Skip if the line is mostly horizontal
                         if (p0.y == p1.y)
                                 continue;
 
@@ -200,23 +238,27 @@ void rasterize_interior(Image <SingleChannel> &dst, const Curve &curve, const gl
                         float cx = p0.x + t * (p1.x - p0.x);
 
                         // Skip if the intersection is outside the viewport
-                        if (cx < min.x || cx > max.x)
+                        if (cx < min.x - viewport.epsilon || cx > max.x + viewport.epsilon)
                                 continue;
 
                         // Convert to screen coordinates
                         // TODO: smooth interpolation?
-                        intersections.push_back(viewport.to_uv_x(cx) * dst.width);
+                        intersections.push_back(viewport.to_uv_x(cx));
                 }
 
-                // Sort and fill
+                // Sort, remove duplicates
                 std::sort(intersections.begin(), intersections.end());
+                intersections.erase(std::unique(intersections.begin(), intersections.end()), intersections.end());
 
                 for (int i = 0; i < intersections.size(); i += 2) {
                         if (i + 1 >= intersections.size())
                                 break;
 
-                        int x0 = std::max(min_x, intersections[i]);
-                        int x1 = std::min(max_x, intersections[i + 1]);
+                        float cx0 = intersections[i];
+                        float cx1 = intersections[i + 1];
+
+                        int x0 = std::max(min_x, int(cx0 * dst.width));
+                        int x1 = std::min(max_x, int(cx1 * dst.width));
 
                         for (int x = x0; x <= x1; x++)
                                 dst(x, y) = 1.0f;
@@ -224,12 +266,68 @@ void rasterize_interior(Image <SingleChannel> &dst, const Curve &curve, const gl
         }
 }
 
+// Compute gradient of line segment using interiors and point sample
+std::pair <glm::vec2, glm::vec2> grad_segment(const Image <SingleChannel> &target, const Image <SingleChannel> &interior, const LineSegment &line, float t)
+{
+        assert(0 <= t && t <= 1.0f);
+
+        // Normal (perpendicular) vector
+        glm::vec2 d = glm::normalize(line.v1 - line.v0);
+        glm::vec2 n = glm::normalize(glm::vec2(-d.y, d.x));
+        glm::vec2 p = line.v0 + t * (line.v1 - line.v0);
+        glm::vec2 dp { 0.0f };
+
+        // Get derivative on neighborhood
+        static constexpr int N = 3;
+
+        glm::vec2 screen_p = viewport.to_screen(p);
+
+        float w_sum = 0.0f;
+        for (int y = -N; y <= N; y++) {
+                for (int x = -N; x <= N; x++) {
+                        // Ensure valid image coordinates
+                        if (screen_p.x + x < 0 || screen_p.x + x >= target.width)
+                                continue;
+
+                        if (screen_p.y + y < 0 || screen_p.y + y >= target.height)
+                                continue;
+
+                        // Compute weight
+                        glm::vec2 q = screen_p + glm::vec2(x, y);
+                        glm::vec2 uv = q / glm::vec2(target.width, target.height);
+                        glm::vec2 pt = viewport.to_cartesian(uv);
+
+                        // Skip if on the line
+                        if (std::fabs(glm::dot(pt - line.v0, line.v1 - line.v0)) < 1e-6f)
+                                continue;
+
+                        float w = glm::length(pt - p);
+
+                        float at = target(uv.x * target.width, uv.y * target.height);
+                        float ai = interior(uv.x * interior.width, uv.y * interior.height);
+                        float delta = at - ai;
+                        
+                        dp += delta * n * w;
+                        w_sum += w;
+                }
+        }
+
+        if (w_sum < 1e-6f)
+                return { glm::vec2 { 0.0f }, glm::vec2 { 0.0f } };
+
+        dp /= w_sum;
+        glm::vec2 dv0 = dp * (1.0f - t);
+        glm::vec2 dv1 = dp * t;
+
+        return { dv0, dv1 };
+}
+
 // Compositing images
-void composite(Image <ColorChannel> &dst, const std::vector <Image <SingleChannel>> &srcs, const std::vector <glm::vec3> &colors)
+void composite(Image <ColorChannel> &dst, const std::vector <const Image <SingleChannel> *> &srcs, const std::vector <glm::vec3> &colors)
 {
         assert(srcs.size() == colors.size());
         for (int i = 0; i < srcs.size(); i++)
-                assert(srcs[i].width == dst.width && srcs[i].height == dst.height);
+                assert(srcs[i]->width == dst.width && srcs[i]->height == dst.height);
 
         // Use src images as the alpha (and use a weighted average)
         for (int y = 0; y < dst.height; y++) {
@@ -238,18 +336,99 @@ void composite(Image <ColorChannel> &dst, const std::vector <Image <SingleChanne
                         float alpha = 0.0f;
 
                         for (int i = 0; i < srcs.size(); i++) {
-                                float a = srcs[i](x, y);
+                                float a = (*srcs[i])(x, y);
                                 color += a * colors[i];
                                 alpha += a;
                         }
 
-                        // if (alpha > 0.0f)
-                        //         color /= alpha;
+                        if (alpha > 0.0f)
+                                color /= alpha;
 
                         dst(x, y) = color;
                 }
         }
 }
+
+// Gradient regularizers
+void laplacian_diffuse(std::vector <glm::vec2> &grad)
+{
+        for (int i = 0; i < grad.size(); i++) {
+                int pi = (i - 1 + grad.size()) % grad.size();
+                int ni = (i + 1) % grad.size();
+
+                grad[i] = (grad[pi] + grad[ni]) / 2.0f;
+        }
+}
+
+struct CurveRasterizer {
+        Curve curve;
+
+        glm::vec2 min;
+        glm::vec2 max;
+        
+        Image <SingleChannel> boundary;
+        Image <SingleChannel> interior;
+
+        CurveRasterizer(const Curve &curve_)
+                        : curve { curve_ },
+                        boundary { WINDOW_WIDTH, WINDOW_HEIGHT },
+                        interior { WINDOW_WIDTH, WINDOW_HEIGHT } {
+                std::tie(min, max) = bounds(curve);
+        }
+
+        void clear() {
+                boundary.clear();
+                interior.clear();
+        }
+
+        void rasterize() {
+                rasterize_boundary(boundary, curve);
+                rasterize_interior(interior, curve, min, max);
+        }
+
+        std::vector <glm::vec2> grad(const Image <SingleChannel> &target, int N) {
+                std::mt19937 rng { std::random_device {}() };
+                std::uniform_real_distribution <float> dist { 0.0f, 1.0f };
+
+                std::vector <glm::vec2> grad { curve.size(), glm::vec2 { 0.0f } };
+                for (int i = 0; i < curve.size(); i++) {
+                        int j = (i + 1) % curve.size();
+
+                        glm::vec2 p0 = curve[i];
+                        glm::vec2 p1 = curve[j];
+
+                        glm::vec2 dv0 { 0.0f };
+                        glm::vec2 dv1 { 0.0f };
+
+                        // TODO: monte carlo estimation
+                        for (int k = 0; k < N; k++) {
+                                float t = dist(rng);
+                                auto [sdv0, sdv1] = grad_segment(target, interior, { p0, p1 }, t);
+                                
+                                dv0 += sdv0;
+                                dv1 += sdv1;
+                        }
+                        
+                        dv0 /= N;
+                        dv1 /= N;
+
+                        // Account for the fact that the gradient is only one line
+                        grad[i] -= 0.5f * dv0;
+                        grad[j] -= 0.5f * dv1;
+                }
+
+                return grad;
+        }
+
+        void step(const std::vector <glm::vec2> &grad, float dt) {
+                for (int i = 0; i < curve.size(); i++) {
+                        assert(!std::isnan(grad[i].x) && !std::isnan(grad[i].y));
+                        curve[i] += dt * grad[i];
+                }
+
+                std::tie(min, max) = bounds(curve);
+        }
+};
 
 int main()
 {
@@ -259,52 +438,84 @@ int main()
                 return -1;
         }
 
-        Image <SingleChannel> boundary { WINDOW_WIDTH, WINDOW_HEIGHT };
-        Image <SingleChannel> interior { WINDOW_WIDTH, WINDOW_HEIGHT };
+        std::vector <CurveRasterizer> rasterizers;
 
-        boundary.clear();
-        interior.clear();
+        {
+                // TODO: generating random closed curves (non intersecting)
+                Curve curve;
 
-        Curve curve;
-       
-        // TODO: generating random closed curves (non intersecting)
+                float radius = 0.5;
+                for (float theta = 0.0f; theta < 2.0f * M_PI; theta += 0.01f) {
+                        float r = 2 * radius;
+                        // for (int n = 0; n < 5; n++)
+                        //         r += 0.4 * pow(0.5f, n) * sin(pow(2.0f, n) * theta);
+                        // r = std::max(0.2f * radius, r);
+                        // 
+                        curve.push_back(glm::vec2 { r * cos(theta), r * sin(theta) });
+                }
 
-        float radius = 0.5;
-        for (float theta = 0.0f; theta < 2.0f * M_PI; theta += 0.01f) {
-                float r = radius;
-                for (int n = 0; n < 5; n++)
-                        r += 0.4 * pow(0.5f, n) * sin(pow(2.0f, n) * theta);
-                r = std::max(0.2f * radius, r);
-                
-                curve.push_back(glm::vec2 { r * cos(theta), r * sin(theta) });
+                printf("Curve elements size: %lu\n", curve.size());
+                rasterizers.emplace_back(curve);
         }
 
-        printf("Curve elements size: %lu\n", curve.size());
+        {
+                Curve curve;
 
-        for (int i = 0; i < curve.size(); i++) {
-                int j = (i + 1) % curve.size();
-                rasterize_boundary(boundary, LineSegment { curve[i], curve[j] });
+                float radius = 0.5;
+                for (float theta = 0.0f; theta < 2.0f * M_PI; theta += 0.1f)
+                        curve.push_back(glm::vec2 { radius * cos(theta), radius * sin(theta) });
+
+                printf("Curve elements size: %lu\n", curve.size());
+                rasterizers.emplace_back(curve);
         }
 
-        auto [min, max] = bounds(curve);
-        // rasterize_interior(interior, boundary, min, max);
-        rasterize_interior(interior, curve, min, max);
+        CurveRasterizer &target = rasterizers[0];
+        CurveRasterizer &source = rasterizers[1];
+        target.rasterize();
 
+        Image <SingleChannel> annotations { WINDOW_WIDTH, WINDOW_HEIGHT };
         Image <ColorChannel> final { WINDOW_WIDTH, WINDOW_HEIGHT };
-
-        std::vector <Image <SingleChannel>> srcs; // { std::move(boundary), std::move(interior) };
-        srcs.emplace_back(std::move(boundary));
-        srcs.emplace_back(std::move(interior));
-
-        std::vector <glm::vec3> colors { { 1.0f, 0.7f, 0.0f }, { 1.0f, 0.7f, 0.0f } };
-        composite(final, srcs, colors);
 
         while (!glfwWindowShouldClose(window)) {
                 // Render here
                 glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
                 glClear(GL_COLOR_BUFFER_BIT);
 
-                // Draw image
+                // Compute gradients and update
+                // TODO: decay
+                source.clear();
+                annotations.clear();
+
+                source.rasterize();
+                auto derivatives = source.grad(target.interior, 100);
+                // laplacian_diffuse(derivatives);
+
+                std::vector <glm::vec2> ann_points;
+                std::vector <glm::vec2> ann_derivatives;
+
+                for (int i = 0; i < source.curve.size(); i++) {
+                        ann_points.push_back(source.curve[i]);
+                        ann_derivatives.push_back(derivatives[i]);
+                }
+
+                quiver(annotations, ann_points, ann_derivatives);
+                source.step(derivatives, 0.01f);
+
+                // Composite and draw
+                composite(final, {
+                        &rasterizers[0].boundary,
+                        &rasterizers[0].interior,
+                        &rasterizers[1].boundary,
+                        &rasterizers[1].interior,
+                        &annotations
+                }, {
+                        { 1.0f, 0.7f, 0.0f },
+                        { 1.0f, 0.7f, 0.0f },
+                        { 0.2f, 0.3f, 0.7f },
+                        { 0.2f, 0.3f, 0.7f },
+                        { 1.0f, 0.2f, 0.2f }
+                });
+
                 glDrawPixels(final.width, final.height, ColorChannel::gl, GL_FLOAT, final.data);
 
                 // Swap front and back buffers
