@@ -94,6 +94,14 @@ struct {
         glm::vec2 to_uv(const glm::vec2 &point) {
                 return (point + glm::vec2 { xrange, yrange }) / (2.0f * glm::vec2 { xrange, yrange });
         }
+
+        float to_uv_x(float x) {
+                return (x + xrange) / (2.0f * xrange);
+        }
+
+        float to_cartesian_y(float y) {
+                return 2 * y * yrange - yrange;
+        }
 } viewport;
 
 // Rasterizing lines
@@ -138,104 +146,6 @@ void rasterize_boundary(Image <SingleChannel> &img, const LineSegment &line)
         }
 }
 
-// Rasterize interior of boundary from MIN to MAX (both Cartesian coordinates)
-void rasterize_interior(Image <SingleChannel> &dst, const Image <SingleChannel> &src, const glm::vec2 &min, const glm::vec2 &max)
-{
-        // Use horizontal line scan
-        float thickness = 2.0f * viewport.epsilon;
-        glm::vec2 min_uv = viewport.to_uv(min - thickness);
-        glm::vec2 max_uv = viewport.to_uv(max + thickness);
-
-        int min_x = std::max(0, int(min_uv.x * src.width));
-        int min_y = std::max(0, int(min_uv.y * src.height));
-        int max_x = std::min(src.width, int(max_uv.x * src.width));
-        int max_y = std::min(src.height, int(max_uv.y * src.height));
-
-        for (int y = min_y; y <= max_y; y++) {
-                const float *row = &src[y][min_x];
-                const float *end = &src[y][max_x];
-
-                int intersect = 0;
-                while (row <= end) {
-                        // Find next boundary
-                        const float *boundary = row;
-                        while (*boundary <= 0.0f && boundary <= end)
-                                boundary++;
-
-                        if (boundary > end)
-                                break;
-
-                        // Skip the actual boundary
-                        int length = 0;
-                        while (*boundary > 0.0f && boundary <= end) {
-                                boundary++;
-                                length++;
-                        }
-
-                        intersect++;
-
-                        // Fill interior
-                        const float *p = boundary;
-                        float *q = &dst[y][min_x + (p - row)];
-
-                        while (p <= end && *p <= 0.0f) {
-                                if (intersect % 2 == 1)
-                                        *q = 0.5f;
-                                else
-                                        *q = 0.0f;
-
-                                p++;
-                                q++;
-                        }
-
-                        row = p;
-                }
-
-                // Backwards scan
-                const float *start = &src[y][min_x];
-
-                row = end;
-                intersect = 0;
-                while (row >= start) {
-                        // Find next boundary
-                        const float *boundary = row;
-                        float *qbdy = &dst[y][max_x + (boundary - row)];
-                        // TODO: tigher boundary check (e.g. 1.0f)
-                        while (*boundary <= 0.0f && boundary >= start) {
-                                *qbdy *= 0;
-                                boundary--;
-                                qbdy--;
-                        }
-
-                        if (boundary < start)
-                                break;
-
-                        // Skip the actual boundary
-                        int length = 0;
-                        while (*boundary > 0.0f && boundary >= start) {
-                                boundary--;
-                                length++;
-                        }
-
-                        intersect++;
-
-                        // Fill interior
-                        const float *p = boundary;
-                        float *q = &dst[y][max_x + (p - row)];
-
-                        while (p >= start && *p <= 0.0f) {
-                                if (intersect % 2 == 0)
-                                        *q *= 0;
-
-                                p--;
-                                q--;
-                        }
-
-                        row = p;
-                }
-        }
-}
-
 using Curve = std::vector <glm::vec2>;
 
 std::pair <glm::vec2, glm::vec2> bounds(const Curve &curve)
@@ -249,6 +159,69 @@ std::pair <glm::vec2, glm::vec2> bounds(const Curve &curve)
         }
 
         return { min, max };
+}
+
+// Rasterize interior of boundary from MIN to MAX (both Cartesian coordinates)
+void rasterize_interior(Image <SingleChannel> &dst, const Curve &curve, const glm::vec2 &min, const glm::vec2 &max)
+{
+        // Use analytical horizontal line scan
+        float thickness = 2.0f * viewport.epsilon;
+        glm::vec2 min_uv = viewport.to_uv(min - thickness);
+        glm::vec2 max_uv = viewport.to_uv(max + thickness);
+
+        int min_x = std::max(0, int(min_uv.x * dst.width));
+        int min_y = std::max(0, int(min_uv.y * dst.height));
+        int max_x = std::min(dst.width, int(max_uv.x * dst.width));
+        int max_y = std::min(dst.height, int(max_uv.y * dst.height));
+
+        for (int y = min_y; y <= max_y; y++) {
+                // Cartesian vertical component
+                float cy = viewport.to_cartesian_y(float(y)/dst.height);
+
+                // Check whether (and when) the curve intersects the horizontal line
+                std::vector <int32_t> intersections;
+                for (int i = 0; i < curve.size(); i++) {
+                        int j = (i + 1) % curve.size();
+                        const glm::vec2 &p0 = curve[i];
+                        const glm::vec2 &p1 = curve[j];
+
+                        // Skip if the line is horizontal
+                        if (p0.y == p1.y)
+                                continue;
+
+                        // Skip if the line does not intersect the horizontal line
+                        if (p0.y < cy && p1.y < cy)
+                                continue;
+                        if (p0.y > cy && p1.y > cy)
+                                continue;
+
+                        // Find the intersection
+                        float t = (cy - p0.y) / (p1.y - p0.y);
+                        float cx = p0.x + t * (p1.x - p0.x);
+
+                        // Skip if the intersection is outside the viewport
+                        if (cx < min.x || cx > max.x)
+                                continue;
+
+                        // Convert to screen coordinates
+                        // TODO: smooth interpolation?
+                        intersections.push_back(viewport.to_uv_x(cx) * dst.width);
+                }
+
+                // Sort and fill
+                std::sort(intersections.begin(), intersections.end());
+
+                for (int i = 0; i < intersections.size(); i += 2) {
+                        if (i + 1 >= intersections.size())
+                                break;
+
+                        int x0 = std::max(min_x, intersections[i]);
+                        int x1 = std::min(max_x, intersections[i + 1]);
+
+                        for (int x = x0; x <= x1; x++)
+                                dst(x, y) = 1.0f;
+                }
+        }
 }
 
 // Compositing images
@@ -293,10 +266,18 @@ int main()
         interior.clear();
 
         Curve curve;
-        
+       
+        // TODO: generating random closed curves (non intersecting)
+
         float radius = 0.5;
-        for (float theta = 0.0f; theta < 2.0f * M_PI; theta += 0.1f)
-                curve.push_back(glm::vec2 { radius * cos(theta), radius * sin(theta) });
+        for (float theta = 0.0f; theta < 2.0f * M_PI; theta += 0.01f) {
+                float r = radius;
+                for (int n = 0; n < 5; n++)
+                        r += 0.4 * pow(0.5f, n) * sin(pow(2.0f, n) * theta);
+                r = std::max(0.2f * radius, r);
+                
+                curve.push_back(glm::vec2 { r * cos(theta), r * sin(theta) });
+        }
 
         printf("Curve elements size: %lu\n", curve.size());
 
@@ -306,7 +287,8 @@ int main()
         }
 
         auto [min, max] = bounds(curve);
-        rasterize_interior(interior, boundary, min, max);
+        // rasterize_interior(interior, boundary, min, max);
+        rasterize_interior(interior, curve, min, max);
 
         Image <ColorChannel> final { WINDOW_WIDTH, WINDOW_HEIGHT };
 
