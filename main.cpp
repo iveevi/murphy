@@ -8,6 +8,8 @@
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
+#include <omp.h>
+
 #include <glm/glm.hpp>
 #include <glm/gtx/closest_point.hpp>
 #include <glm/gtx/rotate_vector.hpp>
@@ -141,6 +143,7 @@ void rasterize_line(Image <SingleChannel> &img, const LineSegment &line)
         int max_y = std::min(img.height, int(line_max.y * img.height));
 
         // TODO: line search from min y to max y (including thickness)
+        #pragma omp parallel for
         for (int y = min_y; y <= max_y; y++) {
                 for (int x = min_x; x <= max_x; x++) {
                         // Project point
@@ -212,6 +215,7 @@ void rasterize_interior(Image <SingleChannel> &dst, const Curve &curve, const gl
         int max_x = std::min(dst.width, int(max_uv.x * dst.width));
         int max_y = std::min(dst.height, int(max_uv.y * dst.height));
 
+        #pragma omp parallel for
         for (int y = min_y; y <= max_y; y++) {
                 // Cartesian vertical component
                 float cy = viewport.to_cartesian_y(float(y)/dst.height);
@@ -305,9 +309,9 @@ std::pair <glm::vec2, glm::vec2> grad_segment(const Image <SingleChannel> &targe
 
                         float at = target(uv.x * target.width, uv.y * target.height);
                         float ai = interior(uv.x * interior.width, uv.y * interior.height);
-                        float delta = at - ai;
+                        float delta = std::abs(ai - at);
                         
-                        dp += delta * n * w;
+                        dp += delta * n * w * glm::sign(glm::dot(pt - p, n));
                         w_sum += w;
                 }
         }
@@ -352,11 +356,12 @@ void composite(Image <ColorChannel> &dst, const std::vector <const Image <Single
 // Gradient regularizers
 void laplacian_diffuse(std::vector <glm::vec2> &grad)
 {
+        auto copy = grad;
         for (int i = 0; i < grad.size(); i++) {
                 int pi = (i - 1 + grad.size()) % grad.size();
                 int ni = (i + 1) % grad.size();
 
-                grad[i] = (grad[pi] + grad[ni]) / 2.0f;
+                grad[i] = (copy[pi] + 2.0f * copy[i] + copy[ni]) / 4.0f;
         }
 }
 
@@ -386,6 +391,23 @@ struct CurveRasterizer {
                 rasterize_interior(interior, curve, min, max);
         }
 
+        std::vector <glm::vec2> normal() {
+                std::vector <glm::vec2> normal { curve.size(), glm::vec2 { 0.0f } };
+                for (int i = 0; i < curve.size(); i++) {
+                        int j = (i + 1) % curve.size();
+
+                        glm::vec2 p0 = curve[i];
+                        glm::vec2 p1 = curve[j];
+
+                        glm::vec2 d = glm::normalize(p1 - p0);
+                        glm::vec2 n = glm::normalize(glm::vec2(-d.y, d.x));
+
+                        normal[i] = n;
+                }
+
+                return normal;
+        }
+
         std::vector <glm::vec2> grad(const Image <SingleChannel> &target, int N) {
                 std::mt19937 rng { std::random_device {}() };
                 std::uniform_real_distribution <float> dist { 0.0f, 1.0f };
@@ -413,8 +435,8 @@ struct CurveRasterizer {
                         dv1 /= N;
 
                         // Account for the fact that the gradient is only one line
-                        grad[i] -= 0.5f * dv0;
-                        grad[j] -= 0.5f * dv1;
+                        grad[i] += 0.5f * dv0;
+                        grad[j] += 0.5f * dv1;
                 }
 
                 return grad;
@@ -446,10 +468,10 @@ int main()
 
                 float radius = 0.5;
                 for (float theta = 0.0f; theta < 2.0f * M_PI; theta += 0.01f) {
-                        float r = 2 * radius;
-                        // for (int n = 0; n < 5; n++)
-                        //         r += 0.4 * pow(0.5f, n) * sin(pow(2.0f, n) * theta);
-                        // r = std::max(0.2f * radius, r);
+                        float r = radius;
+                        for (int n = 0; n < 5; n++)
+                                r += 0.5 * pow(0.5f, n) * sin(pow(2.0f, n) * theta);
+                        r = std::max(0.2f * radius, r);
                         // 
                         curve.push_back(glm::vec2 { r * cos(theta), r * sin(theta) });
                 }
@@ -473,32 +495,38 @@ int main()
         CurveRasterizer &source = rasterizers[1];
         target.rasterize();
 
-        Image <SingleChannel> annotations { WINDOW_WIDTH, WINDOW_HEIGHT };
+        Image <SingleChannel> ann_grad { WINDOW_WIDTH, WINDOW_HEIGHT };
+        Image <SingleChannel> ann_normal { WINDOW_WIDTH, WINDOW_HEIGHT };
         Image <ColorChannel> final { WINDOW_WIDTH, WINDOW_HEIGHT };
 
         while (!glfwWindowShouldClose(window)) {
                 // Render here
-                glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
+                glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
                 glClear(GL_COLOR_BUFFER_BIT);
 
                 // Compute gradients and update
                 // TODO: decay
                 source.clear();
-                annotations.clear();
+                ann_grad.clear();
+                ann_normal.clear();
 
                 source.rasterize();
                 auto derivatives = source.grad(target.interior, 100);
-                // laplacian_diffuse(derivatives);
+                auto normals = source.normal();
+                laplacian_diffuse(derivatives);
 
                 std::vector <glm::vec2> ann_points;
                 std::vector <glm::vec2> ann_derivatives;
+                std::vector <glm::vec2> ann_normals;
 
                 for (int i = 0; i < source.curve.size(); i++) {
                         ann_points.push_back(source.curve[i]);
                         ann_derivatives.push_back(derivatives[i]);
+                        ann_normals.push_back(0.1f * normals[i]);
                 }
 
-                quiver(annotations, ann_points, ann_derivatives);
+                quiver(ann_grad, ann_points, ann_derivatives);
+                quiver(ann_normal, ann_points, ann_normals);
                 source.step(derivatives, 0.01f);
 
                 // Composite and draw
@@ -507,13 +535,15 @@ int main()
                         &rasterizers[0].interior,
                         &rasterizers[1].boundary,
                         &rasterizers[1].interior,
-                        &annotations
+                        &ann_grad,
+                        &ann_normal
                 }, {
                         { 1.0f, 0.7f, 0.0f },
                         { 1.0f, 0.7f, 0.0f },
                         { 0.2f, 0.3f, 0.7f },
                         { 0.2f, 0.3f, 0.7f },
-                        { 1.0f, 0.2f, 0.2f }
+                        { 1.0f, 0.2f, 0.2f },
+                        { 0.2f, 1.0f, 0.2f }
                 });
 
                 glDrawPixels(final.width, final.height, ColorChannel::gl, GL_FLOAT, final.data);
