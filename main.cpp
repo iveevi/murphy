@@ -5,6 +5,8 @@
 #include <tuple>
 #include <random>
 #include <optional>
+#include <string>
+#include <map>
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -20,8 +22,8 @@
 #include <glm/gtx/closest_point.hpp>
 #include <glm/gtx/rotate_vector.hpp>
 
-constexpr int WINDOW_WIDTH = 750;
-constexpr int WINDOW_HEIGHT = 750;
+constexpr int WINDOW_WIDTH = 500;
+constexpr int WINDOW_HEIGHT = 500;
 
 GLFWwindow *glfw_init();
 
@@ -88,9 +90,50 @@ struct Image {
                 return data + y * width;
         }
 
+        void copy(const Image &other) {
+                // If same dimensions, plain copy, otherwise use UV sampling
+                if (width == other.width && height == other.height) {
+                        std::copy(other.data, other.data + width * height * Channel::channels, data);
+                } else {
+                        #pragma omp parallel for
+                        for (int y = 0; y < height; y++) {
+                                for (int x = 0; x < width; x++) {
+                                        float u = float(x) / width;
+                                        float v = float(y) / height;
+
+                                        int ox = u * other.width;
+                                        int oy = v * other.height;
+
+                                        data[y * width + x] = other.data[oy * other.width + ox];
+                                }
+                        }
+                }
+        }
+
         void clear(typename Channel::type val = typename Channel::type { 0 }) {
                 for (int i = 0; i < width * height * Channel::channels; i++)
                         data[i] = val;
+        }
+
+        void smooth(int K) {
+                Image <Channel> tmp(width, height);
+                #pragma omp parallel for
+                for (int y = 0; y < height; y++) {
+                        for (int x = 0; x < width; x++) {
+                                typename Channel::type sum = typename Channel::type { 0 };
+                                for (int dy = -K; dy <= K; dy++) {
+                                        for (int dx = -K; dx <= K; dx++) {
+                                                int nx = x + dx;
+                                                int ny = y + dy;
+                                                if (nx < 0 || nx >= width || ny < 0 || ny >= height)
+                                                        continue;
+                                                sum += (*this)(nx, ny);
+                                        }
+                                }
+                                tmp(x, y) = sum / ((2 * K + 1) * (2 * K + 1));
+                        }
+                }
+                copy(tmp);
         }
 };
 
@@ -282,20 +325,30 @@ void rasterize_interior(Image <SingleChannel> &dst, const Curve &curve, const gl
 // Intersection over union
 float iou(const Image <SingleChannel> &a, const Image <SingleChannel> &b)
 {
-        assert(a.width == b.width && a.height == b.height);
+        int width = std::min(a.width, b.width);
+        int height = std::min(a.height, b.height);
 
         float intersection = 0.0f;
         float union_ = 0.0f;
 
-        for (int y = 0; y < a.height; y++) {
-                for (int x = 0; x < a.width; x++) {
-                        intersection += a(x, y) * b(x, y);
-                        union_ += std::max(a(x, y), b(x, y));
+        for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                        float u = x / float(width);
+                        float v = y / float(height);
+
+                        int ax = int(u * a.width);
+                        int ay = int(v * a.height);
+
+                        int bx = int(u * b.width);
+                        int by = int(v * b.height);
+
+                        intersection += a(ax, ay) * b(bx, by);
+                        union_ += std::max(a(ax, ay), b(bx, by));
                 }
         }
 
-        intersection /= a.width * a.height;
-        union_ /= a.width * a.height;
+        intersection /= width * height;
+        union_ /= width * height;
 
         return intersection / union_;
 }
@@ -373,7 +426,7 @@ void composite(Image <ColorChannel> &dst,
                         float u = x / float(dst.width);
                         float v = y / float(dst.height);
 
-                        glm::vec3 color { 0.0f };
+                        glm::vec3 color = dst(x, y);
                         for (int i = 0; i < srcs.size(); i++) {
                                 int x_ = u * srcs[i]->width;
                                 int y_ = v * srcs[i]->height;
@@ -500,7 +553,7 @@ void loop_untangle(Curve &curve, std::vector <glm::vec2> &grad)
 
 // Optimizers
 struct Optimizer {
-        virtual void step(Curve &curve, const std::vector <glm::vec2> &grad) = 0;
+        virtual float step(Curve &curve, const std::vector <glm::vec2> &grad) = 0;
 };
 
 struct SGD : Optimizer {
@@ -508,9 +561,14 @@ struct SGD : Optimizer {
 
         SGD(float alpha_) : alpha { alpha_ } {}
 
-        void step(Curve &curve, const std::vector <glm::vec2> &grad) override {
-                for (int i = 0; i < curve.size(); i++)
+        float step(Curve &curve, const std::vector <glm::vec2> &grad) override {
+                float grad_avg = 0.0f;
+                for (int i = 0; i < curve.size(); i++) {
                         curve[i] += alpha * grad[i];
+                        grad_avg += glm::length(grad[i]);
+                }
+
+                return grad_avg / curve.size();
         }
 };
 
@@ -523,7 +581,7 @@ struct Momentum : Optimizer {
         Momentum(float alpha_, float eta_ = 0.9)
                 : alpha { alpha_ }, eta { eta_ } {}
 
-        void step(Curve &curve, const std::vector <glm::vec2> &grad) override {
+        float step(Curve &curve, const std::vector <glm::vec2> &grad) override {
                 if (v.size() != curve.size()) {
                         printf("Initializing momentum\n");
                         v.resize(curve.size());
@@ -533,10 +591,32 @@ struct Momentum : Optimizer {
                                 v[i] = glm::vec2 { 0.0f };
                 }
 
+                float grad_avg = 0.0f;
                 for (int i = 0; i < curve.size(); i++) {
+                        assert(!glm::any(glm::isnan(grad[i])));
                         v[i] = eta * v[i] + alpha * grad[i];
                         curve[i] += v[i];
+                        grad_avg += glm::length(grad[i]);
                 }
+
+                return grad_avg / curve.size();
+        }
+
+        void upscale(const Curve &curve, const std::map <int32_t,int32_t> &new_indices) {
+                printf("Upscaling momentum to %d\n", curve.size());
+                std::vector <glm::vec2> new_v(curve.size());
+                for (int i = 0; i < curve.size(); i++) {
+                        if (new_indices.count(i) == 0) {
+                                new_v[i] = v[i];
+                        } else {
+                                int j = new_indices.at(i);
+                                int nj = (j + 1) % v.size();
+
+                                new_v[i] = 0.5f * (v[j] + v[nj]);
+                        }
+                }
+
+                v = std::move(new_v);
         }
 };
 
@@ -583,11 +663,27 @@ struct CurveRasterizer {
                 return normal;
         }
 
+        float length() {
+                float length = 0.0f;
+                for (int i = 0; i < curve.size(); i++) {
+                        int j = (i + 1) % curve.size();
+
+                        glm::vec2 p0 = curve[i];
+                        glm::vec2 p1 = curve[j];
+
+                        length += glm::length(p1 - p0);
+                }
+
+                return length;
+        }
+
         std::vector <glm::vec2> grad(const Image <SingleChannel> &target, int N) {
                 std::mt19937 rng { std::random_device {}() };
                 std::uniform_real_distribution <float> dist { 0.0f, 1.0f };
 
                 std::vector <glm::vec2> grad { curve.size(), glm::vec2 { 0.0f } };
+
+                #pragma omp parallel for
                 for (int i = 0; i < curve.size(); i++) {
                         int j = (i + 1) % curve.size();
 
@@ -617,32 +713,69 @@ struct CurveRasterizer {
                 return grad;
         }
 
-        void subdivide(float min_length = 1e-2f) {
+        std::map <int32_t, int32_t> adaptive_subdivide(const std::vector <glm::vec2> &grad) {
+                float redist = 0.8 * length() / curve.size();
+
+                // Subdivide based on redistributing length
                 std::vector <glm::vec2> new_curve;
-                // TODO: only subdivide regions with active gradients
+                std::map <int32_t, int32_t> new_indices;
                 for (int i = 0; i < curve.size(); i++) {
                         int j = (i + 1) % curve.size();
 
                         glm::vec2 p0 = curve[i];
                         glm::vec2 p1 = curve[j];
 
-                        float d = glm::distance(p0, p1);
-                        if (d < min_length) {
-                                new_curve.push_back(p0);
-                                continue;
-                        }
+                        float d = glm::length(p1 - p0);
+                        int n = std::max(1, (int)std::round(d/redist));
 
-                        glm::vec2 m = 0.5f * (p0 + p1);
-                        new_curve.push_back(p0);
-                        new_curve.push_back(m);
+                        for (int k = 0; k < n; k++) {
+                                float t = (float) k / (float) n;
+                                glm::vec2 p = (1.0f - t) * p0 + t * p1;
+
+                                new_indices[new_curve.size()] = i;
+                                new_curve.push_back(p);
+                        }
                 }
 
                 curve = new_curve;
-                std::tie(min, max) = bounds(curve);
+                update();
+
+                printf("Subdivided to %d\n", curve.size());
+
+                return new_indices;
         }
 
         void update() {
                 std::tie(min, max) = bounds(curve);
+        }
+};
+
+// Sliding window for average and variance
+template <size_t N>
+struct SlidingWindow {
+        float window[N];
+        int index;
+        bool full;
+
+        float mean;
+        float variance;
+
+        SlidingWindow() : index { 0 }, full { false }, mean { 0.0f }, variance { 0.0f } {
+                for (int i = 0; i < N; i++)
+                        window[i] = 0.0f;
+        }
+
+        void push(float value) {
+                float old = window[index];
+                float old_mean = mean;
+                window[index] = value;
+
+                index = (index + 1) % N;
+                full = full || index == 0;
+                int size = full ? N : index;
+
+                mean += (value - old) / N;
+                variance += (value - old) * (value - mean + old - old_mean) / N;
         }
 };
 
@@ -664,19 +797,31 @@ int main(int argc, char *argv[])
         stbi_set_flip_vertically_on_load(true);
         unsigned char *data = stbi_load(path.c_str(), &width, &height, &channels, 0);
 
-        Image <SingleChannel> target_image { width, height };
+        Image <SingleChannel> target_interior { width, height };
+        Image <ColorChannel> target_display{ width, height };
+
         for (int i = 0; i < width * height; i++) {
                 float r = data[channels * i + 0] / 255.0f;
                 float g = data[channels * i + 1] / 255.0f;
                 float b = data[channels * i + 2] / 255.0f;
+                float a = channels == 4 ? data[channels * i + 3] / 255.0f : 1.0f;
+                // TODO: alpha as flag (default on)
 
-                float L = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+                float L = a * (0.2126f * r + 0.7152f * g + 0.0722f * b);
 
                 int x = i % width;
                 int y = i / width;
 
-                target_image(x, y) = invert ? 1.0f - L : L;
+                // TODO: args for alpha smooth cutoff
+                target_interior(x, y) = invert ? 1.0f - L : L;
+                target_interior(x, y) = glm::smoothstep(0.0f, 0.2f, target_interior(x, y));
+
+                // TODO: color alpha
+                target_display(x, y) = { r, g, b };
         }
+
+        // TODO: smooth the interior image
+        // target_interior.smooth(3);
 
         if (!data) {
                 fprintf(stderr, "Failed to load image: %s\n", path.c_str());
@@ -693,41 +838,16 @@ int main(int argc, char *argv[])
                 return -1;
         }
 
-        std::vector <CurveRasterizer> rasterizers;
+        // Create initial curve
+        Curve curve;
+        float radius = 0.5;
+        for (float theta = 0.0f; theta < 2.0f * M_PI; theta += 0.01f)
+                curve.push_back(glm::vec2 { radius * cos(theta), radius * sin(theta) });
 
-        {
-                // TODO: generating random closed curves (non intersecting)
-                Curve curve;
+        printf("Curve elements size: %lu\n", curve.size());
+        CurveRasterizer source { curve };
 
-                float radius = 0.5;
-                for (float theta = 0.0f; theta < 2.0f * M_PI; theta += 0.01f) {
-                        float r = radius;
-                        for (int n = 0; n < 10; n++)
-                                r += 0.4 * pow(0.5f, n) * sin(pow(2.0f, n) * theta);
-                        r = std::max(0.2f * radius, r);
-                        // 
-                        curve.push_back(glm::vec2 { r * cos(theta), r * sin(theta) });
-                }
-
-                printf("Curve elements size: %lu\n", curve.size());
-                rasterizers.emplace_back(curve);
-        }
-
-        {
-                Curve curve;
-
-                float radius = 0.5;
-                for (float theta = 0.0f; theta < 2.0f * M_PI; theta += 0.01f)
-                        curve.push_back(glm::vec2 { radius * cos(theta), radius * sin(theta) });
-
-                printf("Curve elements size: %lu\n", curve.size());
-                rasterizers.emplace_back(curve);
-        }
-
-        CurveRasterizer &target = rasterizers[0];
-        CurveRasterizer &source = rasterizers[1];
-        target.rasterize();
-
+        // Allocate images for rendering
         Image <SingleChannel> ann_grad { WINDOW_WIDTH, WINDOW_HEIGHT };
         Image <SingleChannel> ann_normal { WINDOW_WIDTH, WINDOW_HEIGHT };
         Image <ColorChannel> final { WINDOW_WIDTH, WINDOW_HEIGHT };
@@ -738,17 +858,21 @@ int main(int argc, char *argv[])
         uint8_t *frame = new uint8_t[WINDOW_WIDTH * WINDOW_HEIGHT * 4];
 
         int power = 100;
-        bool show_reference = true;
+        bool show_target_alpha = false;
         bool show_normal = false;
         bool show_gradient = false;
 
         bool pause = false;
         bool pause_rise = false;
 
+        std::map <int, bool> pressed;
+
         int iterations = 0;
-        Optimizer *opt = new Momentum { 0.01f };
+        SlidingWindow <10> iou_window;
+        Momentum opt = Momentum { 0.01f };
 
         // TODO: max number of iterations
+        // TODO: ImGui
         while (!glfwWindowShouldClose(window)) {
                 glfwPollEvents();
                 if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
@@ -761,6 +885,13 @@ int main(int argc, char *argv[])
                         pause_rise = false;
                 }
 
+                if (glfwGetKey(window, GLFW_KEY_T) == GLFW_PRESS && !pressed[GLFW_KEY_T]) {
+                        show_target_alpha = !show_target_alpha;
+                        pressed[GLFW_KEY_T] = true;
+                } else if (glfwGetKey(window, GLFW_KEY_T) == GLFW_RELEASE) {
+                        pressed[GLFW_KEY_T] = false;
+                }
+
                 if (pause)
                         continue;
 
@@ -769,14 +900,15 @@ int main(int argc, char *argv[])
                 glClear(GL_COLOR_BUFFER_BIT);
 
                 // Compute gradients and update
-                // TODO: decay
+                final.clear(glm::vec3 {1.0f});
+
                 source.clear();
                 ann_grad.clear();
                 ann_normal.clear();
 
                 source.rasterize();
                 // auto derivatives = source.grad(target.interior, 5);
-                auto derivatives = source.grad(target_image, 5);
+                auto derivatives = source.grad(target_interior, 5);
                 auto normals = source.normal();
 
                 resolve_grad_collisions(source.curve, derivatives);
@@ -789,7 +921,7 @@ int main(int argc, char *argv[])
                 for (int i = 0; i < source.curve.size(); i += 10) {
                         ann_points.push_back(source.curve[i]);
                         ann_derivatives.push_back(derivatives[i]);
-                        ann_normals.push_back(0.1f * normals[i]);
+                        ann_normals.push_back(0.02f * normals[i]);
                 }
 
                 if (show_normal)
@@ -798,27 +930,40 @@ int main(int argc, char *argv[])
                 if (show_gradient)
                         quiver(ann_grad, ann_points, ann_derivatives);
 
-                opt->step(source.curve, derivatives);
+                float grad_avg = opt.step(source.curve, derivatives);
                 source.update();
 
                 // Composite and draw
-                composite(final, {
-                        // &rasterizers[0].boundary,
-                        // &rasterizers[0].interior,
-                        &target_image,
-                        &rasterizers[1].boundary,
-                        &rasterizers[1].interior,
-                        &ann_grad,
-                        &ann_normal
-                }, {
-                        // { 1.0f, 0.7f, 0.0f },
-                        { 1.0f, 0.7f, 0.5f },
-                        { 0.2f, 0.f, 0.7f },
-                        { 0.4f, 0.5f, 0.7f },
-                        { 1.0f, 0.2f, 0.2f },
-                        { 0.2f, 1.0f, 0.2f }
-                }, { 0.4f, 1.0f, 0.4f, 1.0f, 1.0f });
+                if (!show_target_alpha)
+                        final.copy(target_display);
 
+                std::vector <const Image <SingleChannel> *> images;
+                std::vector <glm::vec3> colors;
+                std::vector <float> alphas;
+
+                images.push_back(&source.boundary);
+                colors.push_back({ 0.0f, 1.0f, 1.0f });
+                alphas.push_back(1.0f);
+
+                images.push_back(&source.interior);
+                colors.push_back({ 0.4f, 0.5f, 0.7f });
+                alphas.push_back(0.4f);
+
+                images.push_back(&ann_grad);
+                colors.push_back({ 1.0f, 0.2f, 0.2f });
+                alphas.push_back(1.0f);
+
+                images.push_back(&ann_normal);
+                colors.push_back({ 0.2f, 1.0f, 0.2f });
+                alphas.push_back(1.0f);
+
+                if (show_target_alpha) {
+                        images.push_back(&target_interior);
+                        colors.push_back({ 0.7f, 0.8f, 0.2f });
+                        alphas.push_back(0.5f);
+                }
+
+                composite(final, images, colors, alphas);
                 glDrawPixels(final.width, final.height, ColorChannel::gl, GL_FLOAT, final.data);
 
                 // Write frame to GIF
@@ -826,18 +971,25 @@ int main(int argc, char *argv[])
                 GifWriteFrame(&gif, frame, WINDOW_WIDTH, WINDOW_HEIGHT, 2);
 
                 // Print info
-                float metric = iou(target.interior, source.interior);
+                float metric = iou(target_interior, source.interior);
                 // printf("\033[2J\033[1;1H");
                 // printf("IOU: %f\n", metric);
 
                 if (metric > 0.85)
-                        power = 20; // TODO: depends on the curve size
+                        power = 20; // TODO: also depends on the curve size (and
+                // variance of grdients)
                 if (metric > 0.95)
                         power = 1;
 
-                if ((++iterations) % 100 == 0) {
-                        printf("Subdividing\n");
-                        source.subdivide();
+                // Subdivide the curve if needed
+                iou_window.push(100.0f * metric);
+
+                // printf("IOU: %f, mean: %f, variance: %f\n", metric, iou_window.mean, iou_window.variance);
+
+                if ((++iterations) % 50 == 0) {
+                        printf("Subdividing, gradient average: %f\n", grad_avg);
+                        auto new_indices = source.adaptive_subdivide(derivatives);
+                        opt.upscale(source.curve, new_indices);
                 }
 
                 // Swap front and back buffers
