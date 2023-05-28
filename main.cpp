@@ -4,9 +4,13 @@
 #include <utility>
 #include <tuple>
 #include <random>
+#include <optional>
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb/stb_image.h>
 
 #include <omp.h>
 
@@ -146,6 +150,9 @@ void rasterize_line(Image <SingleChannel> &img, const LineSegment &line)
         #pragma omp parallel for
         for (int y = min_y; y <= max_y; y++) {
                 for (int x = min_x; x <= max_x; x++) {
+                        if (x < 0 || x >= img.width || y < 0 || y >= img.height)
+                                continue;
+
                         // Project point
                         glm::vec2 uv = glm::vec2 { x, y } / glm::vec2 { img.width, img.height };
                         glm::vec2 point = glm::vec2 { viewport.xrange, viewport.yrange } * (uv - 0.5f) * 2.0f;
@@ -270,6 +277,27 @@ void rasterize_interior(Image <SingleChannel> &dst, const Curve &curve, const gl
         }
 }
 
+// Intersection over union
+float iou(const Image <SingleChannel> &a, const Image <SingleChannel> &b)
+{
+        assert(a.width == b.width && a.height == b.height);
+
+        float intersection = 0.0f;
+        float union_ = 0.0f;
+
+        for (int y = 0; y < a.height; y++) {
+                for (int x = 0; x < a.width; x++) {
+                        intersection += a(x, y) * b(x, y);
+                        union_ += std::max(a(x, y), b(x, y));
+                }
+        }
+
+        intersection /= a.width * a.height;
+        union_ /= a.width * a.height;
+
+        return intersection / union_;
+}
+
 // Compute gradient of line segment using interiors and point sample
 std::pair <glm::vec2, glm::vec2> grad_segment(const Image <SingleChannel> &target, const Image <SingleChannel> &interior, const LineSegment &line, float t)
 {
@@ -284,7 +312,9 @@ std::pair <glm::vec2, glm::vec2> grad_segment(const Image <SingleChannel> &targe
         // Get derivative on neighborhood
         static constexpr int N = 3;
 
-        glm::vec2 screen_p = viewport.to_screen(p);
+        // glm::vec2 screen_p = viewport.to_screen(p);
+        glm::vec2 screen_uv = (p + glm::vec2 { viewport.xrange, viewport.yrange }) / (2.0f * glm::vec2 { viewport.xrange, viewport.yrange });
+        glm::vec2 screen_p = screen_uv * glm::vec2 { target.width, target.height };
 
         float w_sum = 0.0f;
         for (int y = -N; y <= N; y++) {
@@ -298,7 +328,7 @@ std::pair <glm::vec2, glm::vec2> grad_segment(const Image <SingleChannel> &targe
 
                         // Compute weight
                         glm::vec2 q = screen_p + glm::vec2(x, y);
-                        glm::vec2 uv = q / glm::vec2(target.width, target.height);
+                        glm::vec2 uv = q / glm::vec2 { target.width, target.height };
                         glm::vec2 pt = viewport.to_cartesian(uv);
 
                         // Skip if on the line
@@ -327,42 +357,129 @@ std::pair <glm::vec2, glm::vec2> grad_segment(const Image <SingleChannel> &targe
 }
 
 // Compositing images
-void composite(Image <ColorChannel> &dst, const std::vector <const Image <SingleChannel> *> &srcs, const std::vector <glm::vec3> &colors)
+void composite(Image <ColorChannel> &dst,
+               const std::vector <const Image <SingleChannel> *> &srcs,
+               const std::vector <glm::vec3> &colors,
+               const std::vector <float> &alpha_m)
 {
         assert(srcs.size() == colors.size());
-        for (int i = 0; i < srcs.size(); i++)
-                assert(srcs[i]->width == dst.width && srcs[i]->height == dst.height);
+        // for (int i = 0; i < srcs.size(); i++)
+        //         assert(srcs[i]->width == dst.width && srcs[i]->height == dst.height);
 
         // Use src images as the alpha (and use a weighted average)
         for (int y = 0; y < dst.height; y++) {
                 for (int x = 0; x < dst.width; x++) {
+                        float u = x / float(dst.width);
+                        float v = y / float(dst.height);
+
                         glm::vec3 color { 0.0f };
-                        float alpha = 0.0f;
-
                         for (int i = 0; i < srcs.size(); i++) {
-                                float a = (*srcs[i])(x, y);
-                                color += a * colors[i];
-                                alpha += a;
-                        }
+                                int x_ = u * srcs[i]->width;
+                                int y_ = v * srcs[i]->height;
 
-                        if (alpha > 0.0f)
-                                color /= alpha;
+                                float alpha = (*srcs[i])(x_, y_) * alpha_m[i];
+                                if (alpha < 1e-6f)
+                                        continue;
+
+                                color = alpha * colors[i] + (1.0f - alpha) * color;
+                        }
 
                         dst(x, y) = color;
                 }
         }
 }
 
+// Intersection time of ray and circle
+float intersect(const glm::vec2 &o, const glm::vec2 &d, const glm::vec2 &c, float r)
+{
+        // Return -1.0f if no intersection or out of bounds (e.g. t > 1.0f)
+        float a = glm::dot(d, d);
+        float b = 2.0f * glm::dot(d, o - c);
+        float c_ = glm::dot(o - c, o - c) - r * r;
+
+        float delta = b * b - 4.0f * a * c_;
+
+        if (delta < 0.0f)
+                return -1.0f;
+
+        float t0 = (-b - std::sqrt(delta)) / (2.0f * a);
+        float t1 = (-b + std::sqrt(delta)) / (2.0f * a);
+
+        float t = t0 > 0.0f ? t0 : t1;
+
+        if (t < 0.0f || t > 1.0f)
+                return -1.0f;
+
+        return t;
+}
+
+// Intersection point of two line segments
+inline float cross(const glm::vec2 &a, const glm::vec2 &b)
+{
+        return a.x * b.y - a.y * b.x;
+}
+
+std::optional <glm::vec2> intersection_point(const LineSegment &a, const LineSegment &b)
+{
+        glm::vec2 p = a.v0;
+        glm::vec2 r = a.v1 - a.v0;
+        glm::vec2 q = b.v0;
+        glm::vec2 s = b.v1 - b.v0;
+
+        float t = cross(q - p, s) / cross(r, s);
+        float u = cross(q - p, r) / cross(r, s);
+
+        if (t < 0.0f || t > 1.0f || u < 0.0f || u > 1.0f)
+                return std::nullopt;
+
+        return p + t * r;
+}
+
 // Gradient regularizers
-void laplacian_diffuse(std::vector <glm::vec2> &grad)
+void laplacian_diffuse(std::vector <glm::vec2> &grad, int power)
 {
         auto copy = grad;
-        for (int i = 0; i < grad.size(); i++) {
-                int pi = (i - 1 + grad.size()) % grad.size();
-                int ni = (i + 1) % grad.size();
 
-                grad[i] = (copy[pi] + 2.0f * copy[i] + copy[ni]) / 4.0f;
+        for (int i = 0; i < power; i++) {
+                for (int i = 0; i < grad.size(); i++) {
+                        int pi = (i - 1 + grad.size()) % grad.size();
+                        int ni = (i + 1) % grad.size();
+
+                        grad[i] = (copy[pi] + 2.0f * copy[i] + copy[ni]) / 4.0f;
+                }
+
+                if (i + 1 < power)
+                        std::swap(grad, copy);
         }
+}
+
+void resolve_grad_collisions(const Curve &curve, std::vector <glm::vec2> &grad)
+{
+        // Ensure that the gradients will not cause the curve to self-intersect
+        for (int i = 0; i < curve.size(); i++) {
+                int j = (i + 1) % curve.size();
+
+                const glm::vec2 &p0 = curve[i];
+                const glm::vec2 &p1 = curve[j];
+
+                glm::vec2 g0 = grad[i];
+                glm::vec2 g1 = grad[j];
+
+                auto opt = intersection_point({ p0, p0 + g0 }, { p1, p1 + g1 });
+                if (!opt)
+                        continue;
+
+                glm::vec2 p = *opt;
+
+                // Clamp the gradients to (half) the intersection point
+                // grad[i] = 0.5f * (p - p0);
+                // grad[j] = 0.5f * (p - p1);
+        }
+}
+
+void loop_untangle(Curve &curve, std::vector <glm::vec2> &grad)
+{
+
 }
 
 struct CurveRasterizer {
@@ -442,6 +559,30 @@ struct CurveRasterizer {
                 return grad;
         }
 
+        void subdivide(float min_length = 1e-2f) {
+                std::vector <glm::vec2> new_curve;
+                // TODO: only subdivide regions with active gradients
+                for (int i = 0; i < curve.size(); i++) {
+                        int j = (i + 1) % curve.size();
+
+                        glm::vec2 p0 = curve[i];
+                        glm::vec2 p1 = curve[j];
+
+                        float d = glm::distance(p0, p1);
+                        if (d < min_length) {
+                                new_curve.push_back(p0);
+                                continue;
+                        }
+
+                        glm::vec2 m = 0.5f * (p0 + p1);
+                        new_curve.push_back(p0);
+                        new_curve.push_back(m);
+                }
+
+                curve = new_curve;
+                std::tie(min, max) = bounds(curve);
+        }
+
         void step(const std::vector <glm::vec2> &grad, float dt) {
                 for (int i = 0; i < curve.size(); i++) {
                         assert(!std::isnan(grad[i].x) && !std::isnan(grad[i].y));
@@ -460,6 +601,35 @@ int main()
                 return -1;
         }
 
+        // Load target image
+        constexpr char target_path[] = "../duck.jpg";
+
+        int width, height, channels;
+        stbi_set_flip_vertically_on_load(true);
+        unsigned char *data = stbi_load(target_path, &width, &height, &channels, 0);
+
+        Image <SingleChannel> target_image { width, height };
+        for (int i = 0; i < width * height; i++) {
+                float r = data[channels * i + 0] / 255.0f;
+                float g = data[channels * i + 1] / 255.0f;
+                float b = data[channels * i + 2] / 255.0f;
+
+                float L = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+
+                int x = i % width;
+                int y = i / width;
+
+                target_image(x, y) = L;
+        }
+
+        if (!data) {
+                fprintf(stderr, "Failed to load image: %s\n", target_path);
+                return -1;
+        }
+        // TODO: sobel to get boundary
+
+        printf("Loaded image: %s (%dx%d, %d channels)\n", target_path, width, height, channels);
+
         std::vector <CurveRasterizer> rasterizers;
 
         {
@@ -469,8 +639,8 @@ int main()
                 float radius = 0.5;
                 for (float theta = 0.0f; theta < 2.0f * M_PI; theta += 0.01f) {
                         float r = radius;
-                        for (int n = 0; n < 5; n++)
-                                r += 0.5 * pow(0.5f, n) * sin(pow(2.0f, n) * theta);
+                        for (int n = 0; n < 10; n++)
+                                r += 0.4 * pow(0.5f, n) * sin(pow(2.0f, n) * theta);
                         r = std::max(0.2f * radius, r);
                         // 
                         curve.push_back(glm::vec2 { r * cos(theta), r * sin(theta) });
@@ -484,7 +654,7 @@ int main()
                 Curve curve;
 
                 float radius = 0.5;
-                for (float theta = 0.0f; theta < 2.0f * M_PI; theta += 0.1f)
+                for (float theta = 0.0f; theta < 2.0f * M_PI; theta += 0.01f)
                         curve.push_back(glm::vec2 { radius * cos(theta), radius * sin(theta) });
 
                 printf("Curve elements size: %lu\n", curve.size());
@@ -499,7 +669,28 @@ int main()
         Image <SingleChannel> ann_normal { WINDOW_WIDTH, WINDOW_HEIGHT };
         Image <ColorChannel> final { WINDOW_WIDTH, WINDOW_HEIGHT };
 
+        int power = 100;
+        bool show_reference = true;
+
+        bool pause = false;
+        bool pause_rise = false;
+
+        int iterations = 0;
         while (!glfwWindowShouldClose(window)) {
+                glfwPollEvents();
+                if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+                        glfwSetWindowShouldClose(window, GL_TRUE);
+
+                if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS && !pause_rise) {
+                        pause = !pause;
+                        pause_rise = true;
+                } else if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_RELEASE) {
+                        pause_rise = false;
+                }
+
+                if (pause)
+                        continue;
+
                 // Render here
                 glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
                 glClear(GL_COLOR_BUFFER_BIT);
@@ -511,15 +702,18 @@ int main()
                 ann_normal.clear();
 
                 source.rasterize();
-                auto derivatives = source.grad(target.interior, 100);
+                // auto derivatives = source.grad(target.interior, 5);
+                auto derivatives = source.grad(target_image, 5);
                 auto normals = source.normal();
-                laplacian_diffuse(derivatives);
+
+                resolve_grad_collisions(source.curve, derivatives);
+                laplacian_diffuse(derivatives, power);
 
                 std::vector <glm::vec2> ann_points;
                 std::vector <glm::vec2> ann_derivatives;
                 std::vector <glm::vec2> ann_normals;
 
-                for (int i = 0; i < source.curve.size(); i++) {
+                for (int i = 0; i < source.curve.size(); i += 10) {
                         ann_points.push_back(source.curve[i]);
                         ann_derivatives.push_back(derivatives[i]);
                         ann_normals.push_back(0.1f * normals[i]);
@@ -531,28 +725,41 @@ int main()
 
                 // Composite and draw
                 composite(final, {
-                        &rasterizers[0].boundary,
-                        &rasterizers[0].interior,
+                        // &rasterizers[0].boundary,
+                        // &rasterizers[0].interior,
+                        &target_image,
                         &rasterizers[1].boundary,
                         &rasterizers[1].interior,
                         &ann_grad,
                         &ann_normal
                 }, {
-                        { 1.0f, 0.7f, 0.0f },
-                        { 1.0f, 0.7f, 0.0f },
-                        { 0.2f, 0.3f, 0.7f },
-                        { 0.2f, 0.3f, 0.7f },
+                        // { 1.0f, 0.7f, 0.0f },
+                        { 1.0f, 0.7f, 0.5f },
+                        { 0.2f, 0.f, 0.7f },
+                        { 0.4f, 0.5f, 0.7f },
                         { 1.0f, 0.2f, 0.2f },
                         { 0.2f, 1.0f, 0.2f }
-                });
+                }, { 0.4f, 1.0f, 0.4f, 1.0f, 1.0f });
 
                 glDrawPixels(final.width, final.height, ColorChannel::gl, GL_FLOAT, final.data);
 
+                // Print info
+                float metric = iou(target.interior, source.interior);
+                // printf("\033[2J\033[1;1H");
+                // printf("IOU: %f\n", metric);
+
+                if (metric > 0.85)
+                        power = 20; // TODO: depends on the curve size
+                if (metric > 0.95)
+                        power = 1;
+
+                if ((++iterations) % 100 == 0) {
+                        printf("Subdividing\n");
+                        source.subdivide();
+                }
+
                 // Swap front and back buffers
                 glfwSwapBuffers(window);
-
-                // Poll for and process events
-                glfwPollEvents();
         }
 }
 

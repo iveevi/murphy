@@ -8,4 +8,4 @@ find_package(OpenMP REQUIRED)
 
 add_executable(curves main.cpp glad/src/glad.c)
 target_link_libraries(curves glfw OpenMP::OpenMP_CXX)
-include_directories(glad/include glm)
+include_directories(. glad/include glm)
