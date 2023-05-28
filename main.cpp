@@ -14,6 +14,8 @@
 
 #include <omp.h>
 
+#include <gif-h/gif.h>
+
 #include <glm/glm.hpp>
 #include <glm/gtx/closest_point.hpp>
 #include <glm/gtx/rotate_vector.hpp>
@@ -363,10 +365,9 @@ void composite(Image <ColorChannel> &dst,
                const std::vector <float> &alpha_m)
 {
         assert(srcs.size() == colors.size());
-        // for (int i = 0; i < srcs.size(); i++)
-        //         assert(srcs[i]->width == dst.width && srcs[i]->height == dst.height);
 
         // Use src images as the alpha (and use a weighted average)
+        #pragma omp parallel for
         for (int y = 0; y < dst.height; y++) {
                 for (int x = 0; x < dst.width; x++) {
                         float u = x / float(dst.width);
@@ -385,6 +386,21 @@ void composite(Image <ColorChannel> &dst,
                         }
 
                         dst(x, y) = color;
+                }
+        }
+}
+
+void convert(const Image <ColorChannel> &src, uint8_t *data)
+{
+        #pragma omp parallel for
+        for (int y = 0; y < src.height; y++) {
+                for (int x = 0; x < src.width; x++) {
+                        int i = (y * src.width + x) * 4;
+                        int y_ = src.height - y - 1;
+                        data[i + 0] = src(x, y_).r * 255.0f;
+                        data[i + 1] = src(x, y_).g * 255.0f;
+                        data[i + 2] = src(x, y_).b * 255.0f;
+                        data[i + 3] = 255;
                 }
         }
 }
@@ -481,6 +497,48 @@ void loop_untangle(Curve &curve, std::vector <glm::vec2> &grad)
 {
 
 }
+
+// Optimizers
+struct Optimizer {
+        virtual void step(Curve &curve, const std::vector <glm::vec2> &grad) = 0;
+};
+
+struct SGD : Optimizer {
+        float alpha;
+
+        SGD(float alpha_) : alpha { alpha_ } {}
+
+        void step(Curve &curve, const std::vector <glm::vec2> &grad) override {
+                for (int i = 0; i < curve.size(); i++)
+                        curve[i] += alpha * grad[i];
+        }
+};
+
+struct Momentum : Optimizer {
+        std::vector <glm::vec2> v;
+
+        float alpha;
+        float eta;
+
+        Momentum(float alpha_, float eta_ = 0.9)
+                : alpha { alpha_ }, eta { eta_ } {}
+
+        void step(Curve &curve, const std::vector <glm::vec2> &grad) override {
+                if (v.size() != curve.size()) {
+                        printf("Initializing momentum\n");
+                        v.resize(curve.size());
+
+                        // Clear the momentum
+                        for (int i = 0; i < curve.size(); i++)
+                                v[i] = glm::vec2 { 0.0f };
+                }
+
+                for (int i = 0; i < curve.size(); i++) {
+                        v[i] = eta * v[i] + alpha * grad[i];
+                        curve[i] += v[i];
+                }
+        }
+};
 
 struct CurveRasterizer {
         Curve curve;
@@ -583,30 +641,28 @@ struct CurveRasterizer {
                 std::tie(min, max) = bounds(curve);
         }
 
-        void step(const std::vector <glm::vec2> &grad, float dt) {
-                for (int i = 0; i < curve.size(); i++) {
-                        assert(!std::isnan(grad[i].x) && !std::isnan(grad[i].y));
-                        curve[i] += dt * grad[i];
-                }
-
+        void update() {
                 std::tie(min, max) = bounds(curve);
         }
 };
 
-int main()
+int main(int argc, char *argv[])
 {
-        GLFWwindow *window = glfw_init();
-        if (!window) {
-                fprintf(stderr, "Failed to initialize GLFW\n");
-                return -1;
+        // TODO: option for image -> image or circle -> image
+        std::string path = "../duck.jpg";
+        bool invert = false;
+
+        for (int i = 0; i < argc; i++) {
+                if (std::string(argv[i]) == "--invert" || std::string(argv[i]) == "-i")
+                        invert = true;
+                else if (std::string(argv[i]) == "--path" || std::string(argv[i]) == "-p")
+                        path = std::string(argv[i + 1]);
         }
 
         // Load target image
-        constexpr char target_path[] = "../duck.jpg";
-
         int width, height, channels;
         stbi_set_flip_vertically_on_load(true);
-        unsigned char *data = stbi_load(target_path, &width, &height, &channels, 0);
+        unsigned char *data = stbi_load(path.c_str(), &width, &height, &channels, 0);
 
         Image <SingleChannel> target_image { width, height };
         for (int i = 0; i < width * height; i++) {
@@ -619,16 +675,23 @@ int main()
                 int x = i % width;
                 int y = i / width;
 
-                target_image(x, y) = L;
+                target_image(x, y) = invert ? 1.0f - L : L;
         }
 
         if (!data) {
-                fprintf(stderr, "Failed to load image: %s\n", target_path);
+                fprintf(stderr, "Failed to load image: %s\n", path.c_str());
                 return -1;
         }
         // TODO: sobel to get boundary
 
-        printf("Loaded image: %s (%dx%d, %d channels)\n", target_path, width, height, channels);
+        printf("Loaded image: %s (%dx%d, %d channels)\n", path.c_str(), width, height, channels);
+
+        // Initialize GLFW
+        GLFWwindow *window = glfw_init();
+        if (!window) {
+                fprintf(stderr, "Failed to initialize GLFW\n");
+                return -1;
+        }
 
         std::vector <CurveRasterizer> rasterizers;
 
@@ -669,13 +732,23 @@ int main()
         Image <SingleChannel> ann_normal { WINDOW_WIDTH, WINDOW_HEIGHT };
         Image <ColorChannel> final { WINDOW_WIDTH, WINDOW_HEIGHT };
 
+        // Prepare GIF writing
+        GifWriter gif;
+        GifBegin(&gif, "out.gif", WINDOW_WIDTH, WINDOW_HEIGHT, 2);
+        uint8_t *frame = new uint8_t[WINDOW_WIDTH * WINDOW_HEIGHT * 4];
+
         int power = 100;
         bool show_reference = true;
+        bool show_normal = false;
+        bool show_gradient = false;
 
         bool pause = false;
         bool pause_rise = false;
 
         int iterations = 0;
+        Optimizer *opt = new Momentum { 0.01f };
+
+        // TODO: max number of iterations
         while (!glfwWindowShouldClose(window)) {
                 glfwPollEvents();
                 if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
@@ -719,9 +792,14 @@ int main()
                         ann_normals.push_back(0.1f * normals[i]);
                 }
 
-                quiver(ann_grad, ann_points, ann_derivatives);
-                quiver(ann_normal, ann_points, ann_normals);
-                source.step(derivatives, 0.01f);
+                if (show_normal)
+                        quiver(ann_normal, ann_points, ann_normals);
+
+                if (show_gradient)
+                        quiver(ann_grad, ann_points, ann_derivatives);
+
+                opt->step(source.curve, derivatives);
+                source.update();
 
                 // Composite and draw
                 composite(final, {
@@ -743,6 +821,10 @@ int main()
 
                 glDrawPixels(final.width, final.height, ColorChannel::gl, GL_FLOAT, final.data);
 
+                // Write frame to GIF
+                convert(final, frame);
+                GifWriteFrame(&gif, frame, WINDOW_WIDTH, WINDOW_HEIGHT, 2);
+
                 // Print info
                 float metric = iou(target.interior, source.interior);
                 // printf("\033[2J\033[1;1H");
@@ -761,6 +843,9 @@ int main()
                 // Swap front and back buffers
                 glfwSwapBuffers(window);
         }
+
+        // Finish GIF writing
+        GifEnd(&gif);
 }
 
 GLFWwindow *glfw_init()
@@ -770,7 +855,7 @@ GLFWwindow *glfw_init()
 	if (!glfwInit())
 		return nullptr;
 
-	window = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "SDF Engine", NULL, NULL);
+	window = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Murphy", NULL, NULL);
 
 	// Check if window was created
 	if (!window) {
