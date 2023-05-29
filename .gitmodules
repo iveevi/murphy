@@ -1,9 +1,12 @@
 [submodule "glm"]
-	path = glm
+	path = vendor/glm
 	url = https://github.com/g-truc/glm
 [submodule "stb"]
-	path = stb
+	path = vendor/stb
 	url = https://github.com/nothings/stb
 [submodule "gif-h"]
-	path = gif-h
+	path = vendor/gif-h
 	url = https://github.com/charlietangora/gif-h.git
+[submodule "imgui"]
+	path = vendor/imgui
+	url = https://github.com/ocornut/imgui
